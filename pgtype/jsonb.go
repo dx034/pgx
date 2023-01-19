@@ -2,8 +2,9 @@ package pgtype
 
 import (
 	"database/sql/driver"
-	"encoding/json"
 	"fmt"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 type JSONBCodec struct{}
@@ -122,6 +123,6 @@ func (c JSONBCodec) DecodeValue(m *Map, oid uint32, format int16, src []byte) (a
 	}
 
 	var dst any
-	err := json.Unmarshal(src, &dst)
+	err := jsoniter.ConfigFastest.Unmarshal(src, &dst)
 	return dst, err
 }

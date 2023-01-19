@@ -3,9 +3,10 @@ package pgtype
 import (
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"fmt"
 	"reflect"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 type JSONCodec struct{}
@@ -72,7 +73,7 @@ func (encodePlanJSONCodecEitherFormatByteSlice) Encode(value any, buf []byte) (n
 type encodePlanJSONCodecEitherFormatMarshal struct{}
 
 func (encodePlanJSONCodecEitherFormatMarshal) Encode(value any, buf []byte) (newBuf []byte, err error) {
-	jsonBytes, err := json.Marshal(value)
+	jsonBytes, err := jsoniter.ConfigFastest.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +152,7 @@ func (scanPlanJSONToJSONUnmarshal) Scan(src []byte, dst any) error {
 	elem := reflect.ValueOf(dst).Elem()
 	elem.Set(reflect.Zero(elem.Type()))
 
-	return json.Unmarshal(src, dst)
+	return jsoniter.ConfigFastest.Unmarshal(src, dst)
 }
 
 func (c JSONCodec) DecodeDatabaseSQLValue(m *Map, oid uint32, format int16, src []byte) (driver.Value, error) {
@@ -170,6 +171,6 @@ func (c JSONCodec) DecodeValue(m *Map, oid uint32, format int16, src []byte) (an
 	}
 
 	var dst any
-	err := json.Unmarshal(src, &dst)
+	err := jsoniter.ConfigFastest.Unmarshal(src, &dst)
 	return dst, err
 }
