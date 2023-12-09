@@ -3,6 +3,7 @@ package pgtype_test
 import (
 	"context"
 	"encoding/hex"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -51,23 +52,35 @@ func TestArrayCodec(t *testing.T) {
 	})
 }
 
-func TestArrayCodecFlatArray(t *testing.T) {
+func TestArrayCodecFlatArrayString(t *testing.T) {
+	testCases := []struct {
+		input []string
+	}{
+		{nil},
+		{[]string{}},
+		{[]string{"a"}},
+		{[]string{"a", "b"}},
+		// previously had a bug with whitespace handling
+		{[]string{"\v", "\t", "\n", "\r", "\f", " "}},
+		{[]string{"a\vb", "a\tb", "a\nb", "a\rb", "a\fb", "a b"}},
+	}
+
+	queryModes := []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeDescribeExec}
+
 	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
-		for i, tt := range []struct {
-			expected any
-		}{
-			{pgtype.FlatArray[int32](nil)},
-			{pgtype.FlatArray[int32]{}},
-			{pgtype.FlatArray[int32]{1, 2, 3}},
-		} {
-			var actual pgtype.FlatArray[int32]
-			err := conn.QueryRow(
-				ctx,
-				"select $1::int[]",
-				tt.expected,
-			).Scan(&actual)
-			assert.NoErrorf(t, err, "%d", i)
-			assert.Equalf(t, tt.expected, actual, "%d", i)
+		for i, testCase := range testCases {
+			for _, queryMode := range queryModes {
+				var out []string
+				err := conn.QueryRow(ctx, "select $1::text[]", queryMode, testCase.input).Scan(&out)
+				if err != nil {
+					t.Fatalf("i=%d input=%#v queryMode=%s: Scan failed: %s",
+						i, testCase.input, queryMode, err)
+				}
+				if !reflect.DeepEqual(out, testCase.input) {
+					t.Errorf("i=%d input=%#v queryMode=%s: not equal output=%#v",
+						i, testCase.input, queryMode, out)
+				}
+			}
 		}
 	})
 }
@@ -103,7 +116,7 @@ func TestArrayCodecArray(t *testing.T) {
 	})
 }
 
-func TestArrayCodecAnySlice(t *testing.T) {
+func TestArrayCodecNamedSliceType(t *testing.T) {
 	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		type _int16Slice []int16
 
@@ -119,6 +132,29 @@ func TestArrayCodecAnySlice(t *testing.T) {
 				ctx,
 				"select $1::smallint[]",
 				tt.expected,
+			).Scan(&actual)
+			assert.NoErrorf(t, err, "%d", i)
+			assert.Equalf(t, tt.expected, actual, "%d", i)
+		}
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1488
+func TestArrayCodecAnySliceArgument(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type _int16Slice []int16
+
+		for i, tt := range []struct {
+			arg      any
+			expected []int16
+		}{
+			{[]any{1, 2, 3}, []int16{1, 2, 3}},
+		} {
+			var actual []int16
+			err := conn.QueryRow(
+				ctx,
+				"select $1::smallint[]",
+				tt.arg,
 			).Scan(&actual)
 			assert.NoErrorf(t, err, "%d", i)
 			assert.Equalf(t, tt.expected, actual, "%d", i)
@@ -293,5 +329,37 @@ func TestArrayCodecEncodeMultipleDimensionsRagged(t *testing.T) {
 		rows, err := conn.Query(ctx, `select $1::int4[]`, [][]int32{{1, 2, 3, 4}, {5}, {9, 10, 11, 12}})
 		require.Error(t, err, "cannot convert [][]int32 to ArrayGetter because it is a ragged multi-dimensional")
 		defer rows.Close()
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1494
+func TestArrayCodecDecodeTextArrayWithTextOfNULL(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		{
+			var actual []string
+			err := conn.QueryRow(ctx, `select '{"foo", "NULL", " NULL "}'::text[]`).Scan(&actual)
+			require.NoError(t, err)
+			require.Equal(t, []string{"foo", "NULL", " NULL "}, actual)
+		}
+
+		{
+			var actual []pgtype.Text
+			err := conn.QueryRow(ctx, `select '{"foo", "NULL", NULL, " NULL "}'::text[]`).Scan(&actual)
+			require.NoError(t, err)
+			require.Equal(t, []pgtype.Text{
+				{String: "foo", Valid: true},
+				{String: "NULL", Valid: true},
+				{},
+				{String: " NULL ", Valid: true},
+			}, actual)
+		}
+	})
+}
+
+func TestArrayCodecDecodeTextArrayPrefersBinaryFormat(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		sd, err := conn.Prepare(ctx, "", `select '{"foo", "NULL", " NULL "}'::text[]`)
+		require.NoError(t, err)
+		require.Equal(t, int16(1), conn.TypeMap().FormatCodeForOID(sd.Fields[0].DataTypeOID))
 	})
 }

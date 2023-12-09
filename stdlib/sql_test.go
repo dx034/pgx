@@ -5,17 +5,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"reflect"
 	"regexp"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/jackc/pgx/v5/tracelog"
 	"github.com/stretchr/testify/assert"
@@ -105,7 +108,7 @@ func testWithAllQueryExecModes(t *testing.T, f func(t *testing.T, db *sql.DB)) {
 }
 
 // Do a simple query to ensure the DB is still usable. This is of less use in stdlib as the connection pool should
-// cover an broken connections.
+// cover broken connections.
 func ensureDBValid(t testing.TB, db *sql.DB) {
 	var sum, rowCount int32
 
@@ -146,9 +149,33 @@ func closeStmt(t *testing.T, stmt *sql.Stmt) {
 }
 
 func TestSQLOpen(t *testing.T) {
-	db, err := sql.Open("pgx", os.Getenv("PGX_TEST_DATABASE"))
+	tests := []struct {
+		driverName string
+	}{
+		{driverName: "pgx"},
+		{driverName: "pgx/v5"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+
+		t.Run(tt.driverName, func(t *testing.T) {
+			db, err := sql.Open(tt.driverName, os.Getenv("PGX_TEST_DATABASE"))
+			require.NoError(t, err)
+			closeDB(t, db)
+		})
+	}
+}
+
+func TestSQLOpenFromPool(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), os.Getenv("PGX_TEST_DATABASE"))
 	require.NoError(t, err)
-	closeDB(t, db)
+	t.Cleanup(pool.Close)
+
+	db := stdlib.OpenDBFromPool(pool)
+	ensureDBValid(t, db)
+
+	db.Close()
 }
 
 func TestNormalLifeCycle(t *testing.T) {
@@ -301,6 +328,102 @@ func TestConnQuery(t *testing.T) {
 
 		err = rows.Close()
 		require.NoError(t, err)
+	})
+}
+
+func TestConnConcurrency(t *testing.T) {
+	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
+		_, err := db.Exec("create table t (id integer primary key, str text, dur_str interval)")
+		require.NoError(t, err)
+
+		defer func() {
+			_, err := db.Exec("drop table t")
+			require.NoError(t, err)
+		}()
+
+		var wg sync.WaitGroup
+
+		concurrency := 50
+		errChan := make(chan error, concurrency)
+
+		for i := 1; i <= concurrency; i++ {
+			wg.Add(1)
+
+			go func(idx int) {
+				defer wg.Done()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+
+				str := strconv.Itoa(idx)
+				duration := time.Duration(idx) * time.Second
+				_, err := db.ExecContext(ctx, "insert into t values($1)", idx)
+				if err != nil {
+					errChan <- fmt.Errorf("insert failed: %d %w", idx, err)
+					return
+				}
+				_, err = db.ExecContext(ctx, "update t set str = $1 where id = $2", str, idx)
+				if err != nil {
+					errChan <- fmt.Errorf("update 1 failed: %d %w", idx, err)
+					return
+				}
+				_, err = db.ExecContext(ctx, "update t set dur_str = $1 where id = $2", duration, idx)
+				if err != nil {
+					errChan <- fmt.Errorf("update 2 failed: %d %w", idx, err)
+					return
+				}
+
+				errChan <- nil
+			}(i)
+		}
+		wg.Wait()
+		for i := 1; i <= concurrency; i++ {
+			err := <-errChan
+			require.NoError(t, err)
+		}
+
+		for i := 1; i <= concurrency; i++ {
+			wg.Add(1)
+
+			go func(idx int) {
+				defer wg.Done()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+
+				var id int
+				var str string
+				var duration pgtype.Interval
+				err := db.QueryRowContext(ctx, "select id,str,dur_str from t where id = $1", idx).Scan(&id, &str, &duration)
+				if err != nil {
+					errChan <- fmt.Errorf("select failed: %d %w", idx, err)
+					return
+				}
+				if id != idx {
+					errChan <- fmt.Errorf("id mismatch: %d %d", idx, id)
+					return
+				}
+				if str != strconv.Itoa(idx) {
+					errChan <- fmt.Errorf("str mismatch: %d %s", idx, str)
+					return
+				}
+				expectedDuration := pgtype.Interval{
+					Microseconds: int64(idx) * time.Second.Microseconds(),
+					Valid:        true,
+				}
+				if duration != expectedDuration {
+					errChan <- fmt.Errorf("duration mismatch: %d %v", idx, duration)
+					return
+				}
+
+				errChan <- nil
+			}(i)
+		}
+		wg.Wait()
+		for i := 1; i <= concurrency; i++ {
+			err := <-errChan
+			require.NoError(t, err)
+		}
 	})
 }
 
@@ -471,7 +594,7 @@ func TestConnQueryJSONIntoByteSlice(t *testing.T) {
 			t.Errorf("Unexpected failure: %v (sql -> %v)", err, sql)
 		}
 
-		if bytes.Compare(actual, expected) != 0 {
+		if !bytes.Equal(actual, expected) {
 			t.Errorf(`Expected "%v", got "%v" (sql -> %v)`, string(expected), string(actual), sql)
 		}
 
@@ -503,7 +626,7 @@ func TestConnExecInsertByteSliceIntoJSON(t *testing.T) {
 	err = db.QueryRow(`select body from docs`).Scan(&actual)
 	require.NoError(t, err)
 
-	if bytes.Compare(actual, expected) != 0 {
+	if !bytes.Equal(actual, expected) {
 		t.Errorf(`Expected "%v", got "%v"`, string(expected), string(actual))
 	}
 
@@ -675,6 +798,34 @@ func TestConnPrepareContextSuccess(t *testing.T) {
 		require.NoError(t, err)
 		err = stmt.Close()
 		require.NoError(t, err)
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1753#issuecomment-1746033281
+// https://github.com/jackc/pgx/issues/1754#issuecomment-1752004634
+func TestConnMultiplePrepareAndDeallocate(t *testing.T) {
+	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
+		skipCockroachDB(t, db, "Server does not support pg_prepared_statements")
+
+		sql := "select 42"
+		stmt1, err := db.PrepareContext(context.Background(), sql)
+		require.NoError(t, err)
+		stmt2, err := db.PrepareContext(context.Background(), sql)
+		require.NoError(t, err)
+		err = stmt1.Close()
+		require.NoError(t, err)
+
+		var preparedStmtCount int64
+		err = db.QueryRowContext(context.Background(), "select count(*) from pg_prepared_statements where statement = $1", sql).Scan(&preparedStmtCount)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, preparedStmtCount)
+
+		err = stmt2.Close() // err isn't as useful as it should be as database/sql will ignore errors from Deallocate.
+		require.NoError(t, err)
+
+		err = db.QueryRowContext(context.Background(), "select count(*) from pg_prepared_statements where statement = $1", sql).Scan(&preparedStmtCount)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, preparedStmtCount)
 	})
 }
 
@@ -1105,9 +1256,9 @@ func TestRandomizeHostOrderFunc(t *testing.T) {
 
 	// Test that at some point we connect to all 3 hosts
 	hostsNotSeenYet := map[string]struct{}{
-		"host1": struct{}{},
-		"host2": struct{}{},
-		"host3": struct{}{},
+		"host1": {},
+		"host2": {},
+		"host3": {},
 	}
 
 	// If we don't succeed within this many iterations, something is certainly wrong

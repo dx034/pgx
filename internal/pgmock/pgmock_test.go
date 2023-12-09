@@ -23,7 +23,7 @@ func TestScript(t *testing.T) {
 	script.Steps = append(script.Steps, pgmock.ExpectMessage(&pgproto3.Query{String: "select 42"}))
 	script.Steps = append(script.Steps, pgmock.SendMessage(&pgproto3.RowDescription{
 		Fields: []pgproto3.FieldDescription{
-			pgproto3.FieldDescription{
+			{
 				Name:                 []byte("?column?"),
 				TableOID:             0,
 				TableAttributeNumber: 0,
@@ -69,9 +69,7 @@ func TestScript(t *testing.T) {
 		}
 	}()
 
-	parts := strings.Split(ln.Addr().String(), ":")
-	host := parts[0]
-	port := parts[1]
+	host, port, _ := strings.Cut(ln.Addr().String(), ":")
 	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

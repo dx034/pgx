@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/internal/nbconn"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
@@ -152,7 +151,7 @@ func BenchmarkMinimalPgConnPreparedSelect(b *testing.B) {
 
 		for rr.NextRow() {
 			for i := range rr.Values() {
-				if bytes.Compare(rr.Values()[0], encodedBytes) != 0 {
+				if !bytes.Equal(rr.Values()[0], encodedBytes) {
 					b.Fatalf("unexpected values: %s %s", rr.Values()[i], encodedBytes)
 				}
 			}
@@ -340,8 +339,9 @@ type benchmarkWriteTableCopyFromSrc struct {
 }
 
 func (s *benchmarkWriteTableCopyFromSrc) Next() bool {
+	next := s.idx < s.count
 	s.idx++
-	return s.idx < s.count
+	return next
 }
 
 func (s *benchmarkWriteTableCopyFromSrc) Values() ([]any, error) {
@@ -401,6 +401,34 @@ func benchmarkWriteNRowsViaInsert(b *testing.B, n int) {
 		}
 
 		err = tx.Commit(context.Background())
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkWriteNRowsViaBatchInsert(b *testing.B, n int) {
+	conn := mustConnect(b, mustParseConfig(b, os.Getenv("PGX_TEST_DATABASE")))
+	defer closeConn(b, conn)
+
+	mustExec(b, conn, benchmarkWriteTableCreateSQL)
+	_, err := conn.Prepare(context.Background(), "insert_t", benchmarkWriteTableInsertSQL)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		src := newBenchmarkWriteTableCopyFromSrc(n)
+
+		batch := &pgx.Batch{}
+		for src.Next() {
+			values, _ := src.Values()
+			batch.Queue("insert_t", values...)
+		}
+
+		err = conn.SendBatch(context.Background(), batch).Close()
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -560,12 +588,31 @@ func benchmarkWriteNRowsViaCopy(b *testing.B, n int) {
 	}
 }
 
+func BenchmarkWrite2RowsViaInsert(b *testing.B) {
+	benchmarkWriteNRowsViaInsert(b, 2)
+}
+
+func BenchmarkWrite2RowsViaMultiInsert(b *testing.B) {
+	benchmarkWriteNRowsViaMultiInsert(b, 2)
+}
+
+func BenchmarkWrite2RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 2)
+}
+
+func BenchmarkWrite2RowsViaCopy(b *testing.B) {
+	benchmarkWriteNRowsViaCopy(b, 2)
+}
+
 func BenchmarkWrite5RowsViaInsert(b *testing.B) {
 	benchmarkWriteNRowsViaInsert(b, 5)
 }
 
 func BenchmarkWrite5RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 5)
+}
+func BenchmarkWrite5RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 5)
 }
 
 func BenchmarkWrite5RowsViaCopy(b *testing.B) {
@@ -579,6 +626,9 @@ func BenchmarkWrite10RowsViaInsert(b *testing.B) {
 func BenchmarkWrite10RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 10)
 }
+func BenchmarkWrite10RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 10)
+}
 
 func BenchmarkWrite10RowsViaCopy(b *testing.B) {
 	benchmarkWriteNRowsViaCopy(b, 10)
@@ -590,6 +640,9 @@ func BenchmarkWrite100RowsViaInsert(b *testing.B) {
 
 func BenchmarkWrite100RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 100)
+}
+func BenchmarkWrite100RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 100)
 }
 
 func BenchmarkWrite100RowsViaCopy(b *testing.B) {
@@ -604,6 +657,10 @@ func BenchmarkWrite1000RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 1000)
 }
 
+func BenchmarkWrite1000RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 1000)
+}
+
 func BenchmarkWrite1000RowsViaCopy(b *testing.B) {
 	benchmarkWriteNRowsViaCopy(b, 1000)
 }
@@ -614,6 +671,9 @@ func BenchmarkWrite10000RowsViaInsert(b *testing.B) {
 
 func BenchmarkWrite10000RowsViaMultiInsert(b *testing.B) {
 	benchmarkWriteNRowsViaMultiInsert(b, 10000)
+}
+func BenchmarkWrite10000RowsViaBatchInsert(b *testing.B) {
+	benchmarkWriteNRowsViaBatchInsert(b, 10000)
 }
 
 func BenchmarkWrite10000RowsViaCopy(b *testing.B) {
@@ -1120,7 +1180,7 @@ func BenchmarkSelectRowsPgConnExecPrepared(b *testing.B) {
 }
 
 type queryRecorder struct {
-	conn      nbconn.Conn
+	conn      net.Conn
 	writeBuf  []byte
 	readCount int
 }
@@ -1134,14 +1194,6 @@ func (qr *queryRecorder) Read(b []byte) (n int, err error) {
 func (qr *queryRecorder) Write(b []byte) (n int, err error) {
 	qr.writeBuf = append(qr.writeBuf, b...)
 	return qr.conn.Write(b)
-}
-
-func (qr *queryRecorder) BufferReadUntilBlock() error {
-	return qr.conn.BufferReadUntilBlock()
-}
-
-func (qr *queryRecorder) Flush() error {
-	return qr.conn.Flush()
 }
 
 func (qr *queryRecorder) Close() error {

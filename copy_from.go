@@ -64,6 +64,33 @@ func (cts *copyFromSlice) Err() error {
 	return cts.err
 }
 
+// CopyFromFunc returns a CopyFromSource interface that relies on nxtf for values.
+// nxtf returns rows until it either signals an 'end of data' by returning row=nil and err=nil,
+// or it returns an error. If nxtf returns an error, the copy is aborted.
+func CopyFromFunc(nxtf func() (row []any, err error)) CopyFromSource {
+	return &copyFromFunc{next: nxtf}
+}
+
+type copyFromFunc struct {
+	next     func() ([]any, error)
+	valueRow []any
+	err      error
+}
+
+func (g *copyFromFunc) Next() bool {
+	g.valueRow, g.err = g.next()
+	// only return true if valueRow exists and no error
+	return g.valueRow != nil && g.err == nil
+}
+
+func (g *copyFromFunc) Values() ([]any, error) {
+	return g.valueRow, g.err
+}
+
+func (g *copyFromFunc) Err() error {
+	return g.err
+}
+
 // CopyFromSource is the interface used by *Conn.CopyFrom as the source for copy data.
 type CopyFromSource interface {
 	// Next returns true if there is another row and makes the next row data
@@ -188,8 +215,13 @@ func (ct *copyFrom) run(ctx context.Context) (int64, error) {
 }
 
 func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (bool, []byte, error) {
+	const sendBufSize = 65536 - 5 // The packet has a 5-byte header
+	lastBufLen := 0
+	largestRowLen := 0
 
 	for ct.rowSrc.Next() {
+		lastBufLen = len(buf)
+
 		values, err := ct.rowSrc.Values()
 		if err != nil {
 			return false, nil, err
@@ -206,7 +238,15 @@ func (ct *copyFrom) buildCopyBuf(buf []byte, sd *pgconn.StatementDescription) (b
 			}
 		}
 
-		if len(buf) > 65536 {
+		rowLen := len(buf) - lastBufLen
+		if rowLen > largestRowLen {
+			largestRowLen = rowLen
+		}
+
+		// Try not to overflow size of the buffer PgConn.CopyFrom will be reading into. If that happens then the nature of
+		// io.Pipe means that the next Read will be short. This can lead to pathological send sizes such as 65531, 13, 65531
+		// 13, 65531, 13, 65531, 13.
+		if len(buf) > sendBufSize-largestRowLen {
 			return true, buf, nil
 		}
 	}

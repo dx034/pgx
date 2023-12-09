@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -43,18 +44,9 @@ type _float32Slice []float32
 type _float64Slice []float64
 type _byteSlice []byte
 
-// unregisteredOID represents a actual type that is not registered. Cannot use 0 because that represents that the type
+// unregisteredOID represents an actual type that is not registered. Cannot use 0 because that represents that the type
 // is not known (e.g. when using the simple protocol).
 const unregisteredOID = uint32(1)
-
-func mustParseCIDR(t testing.TB, s string) *net.IPNet {
-	_, ipnet, err := net.ParseCIDR(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return ipnet
-}
 
 func mustParseInet(t testing.TB, s string) *net.IPNet {
 	ip, ipnet, err := net.ParseCIDR(s)
@@ -291,6 +283,34 @@ func TestScanPlanInterface(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestPointerPointerStructScan(t *testing.T) {
+	m := pgtype.NewMap()
+	type composite struct {
+		ID int
+	}
+
+	int4Type, _ := m.TypeForOID(pgtype.Int4OID)
+	pgt := &pgtype.Type{
+		Codec: &pgtype.CompositeCodec{
+			Fields: []pgtype.CompositeCodecField{
+				{
+					Name: "id",
+					Type: int4Type,
+				},
+			},
+		},
+		Name: "composite",
+		OID:  215333,
+	}
+	m.RegisterType(pgt)
+
+	var c *composite
+	plan := m.PlanScan(pgt.OID, pgtype.TextFormatCode, &c)
+	err := plan.Scan([]byte("(1)"), &c)
+	require.NoError(t, err)
+	require.Equal(t, c.ID, 1)
+}
+
 // https://github.com/jackc/pgx/issues/1263
 func TestMapScanPtrToPtrToSlice(t *testing.T) {
 	m := pgtype.NewMap()
@@ -300,6 +320,22 @@ func TestMapScanPtrToPtrToSlice(t *testing.T) {
 	err := plan.Scan(src, &v)
 	require.NoError(t, err)
 	require.Equal(t, []string{"foo", "bar"}, *v)
+}
+
+func TestMapScanPtrToPtrToSliceOfStruct(t *testing.T) {
+	type Team struct {
+		TeamID int
+		Name   string
+	}
+
+	// Have to use binary format because text format doesn't include type information.
+	m := pgtype.NewMap()
+	src := []byte{0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x8, 0xc9, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x1e, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x17, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x19, 0x0, 0x0, 0x0, 0x6, 0x74, 0x65, 0x61, 0x6d, 0x20, 0x31, 0x0, 0x0, 0x0, 0x1e, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x17, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x19, 0x0, 0x0, 0x0, 0x6, 0x74, 0x65, 0x61, 0x6d, 0x20, 0x32}
+	var v *[]Team
+	plan := m.PlanScan(pgtype.RecordArrayOID, pgtype.BinaryFormatCode, &v)
+	err := plan.Scan(src, &v)
+	require.NoError(t, err)
+	require.Equal(t, []Team{{1, "team 1"}, {2, "team 2"}}, *v)
 }
 
 type databaseValuerString string
@@ -382,6 +418,14 @@ func TestMapEncodeByteSliceIntoUnregisteredTypeTextFormat(t *testing.T) {
 	require.Equal(t, []byte(`\x00010203`), buf)
 }
 
+// https://github.com/jackc/pgx/issues/1763
+func TestMapEncodeNamedTypeOfByteSliceIntoTextTextFormat(t *testing.T) {
+	m := pgtype.NewMap()
+	buf, err := m.Encode(pgtype.TextOID, pgtype.TextFormatCode, json.RawMessage(`{"foo": "bar"}`), nil)
+	require.NoError(t, err)
+	require.Equal(t, []byte(`{"foo": "bar"}`), buf)
+}
+
 // https://github.com/jackc/pgx/issues/1326
 func TestMapScanPointerToRenamedType(t *testing.T) {
 	srcBuf := []byte("foo")
@@ -407,6 +451,90 @@ func TestMapScanNullToWrongType(t *testing.T) {
 	err = m.Scan(pgtype.TextOID, pgx.TextFormatCode, nil, &pn)
 	assert.NoError(t, err)
 	assert.False(t, pn.Valid)
+}
+
+func TestMapScanTextToBool(t *testing.T) {
+	tests := []struct {
+		name string
+		src  []byte
+		want bool
+	}{
+		{"t", []byte("t"), true},
+		{"f", []byte("f"), false},
+		{"y", []byte("y"), true},
+		{"n", []byte("n"), false},
+		{"1", []byte("1"), true},
+		{"0", []byte("0"), false},
+		{"true", []byte("true"), true},
+		{"false", []byte("false"), false},
+		{"yes", []byte("yes"), true},
+		{"no", []byte("no"), false},
+		{"on", []byte("on"), true},
+		{"off", []byte("off"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := pgtype.NewMap()
+
+			var v bool
+			err := m.Scan(pgtype.BoolOID, pgx.TextFormatCode, tt.src, &v)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, v)
+		})
+	}
+}
+
+func TestMapScanTextToBoolError(t *testing.T) {
+	tests := []struct {
+		name string
+		src  []byte
+		want string
+	}{
+		{"nil", nil, "cannot scan NULL into *bool"},
+		{"empty", []byte{}, "cannot scan empty string into *bool"},
+		{"foo", []byte("foo"), "unknown boolean string representation \"foo\""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := pgtype.NewMap()
+
+			var v bool
+			err := m.Scan(pgtype.BoolOID, pgx.TextFormatCode, tt.src, &v)
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+type databaseValuerUUID [16]byte
+
+func (v databaseValuerUUID) Value() (driver.Value, error) {
+	return fmt.Sprintf("%x", v), nil
+}
+
+// https://github.com/jackc/pgx/issues/1502
+func TestMapEncodePlanCacheUUIDTypeConfusion(t *testing.T) {
+	expected := []byte{
+		0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xb, 0x86, 0, 0, 0, 2, 0, 0, 0, 1,
+		0, 0, 0, 16,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		0, 0, 0, 16,
+		15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}
+
+	m := pgtype.NewMap()
+	buf, err := m.Encode(pgtype.UUIDArrayOID, pgtype.BinaryFormatCode,
+		[]databaseValuerUUID{{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}},
+		nil)
+	require.NoError(t, err)
+	require.Equal(t, expected, buf)
+
+	// This actually *should* fail. In the actual query path this error is detected and the encoding falls back to the
+	// text format. In the bug this test is guarding against regression this would panic.
+	_, err = m.Encode(pgtype.UUIDArrayOID, pgtype.BinaryFormatCode,
+		[]string{"00010203-0405-0607-0809-0a0b0c0d0e0f", "0f0e0d0c-0b0a-0908-0706-0504-03020100"},
+		nil)
+	require.Error(t, err)
 }
 
 func BenchmarkMapScanInt4IntoBinaryDecoder(b *testing.B) {
